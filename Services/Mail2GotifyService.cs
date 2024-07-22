@@ -3,11 +3,14 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using SmtpServer;
 using SmtpServer.ComponentModel;
+using SmtpServer.Net;
+using SmtpServer.Tracing;
 using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -22,6 +25,8 @@ namespace Mail2Gotify.Services
         private readonly ILogger<Mail2GotifyService> _logger = logger;
 
         private SmtpServer.SmtpServer _smtpServer;
+
+        static CancellationToken _cancellationToken;
 
         public async Task StartAsync(CancellationToken cancellationToken)
         {
@@ -73,6 +78,8 @@ namespace Mail2Gotify.Services
                 .Certificate(x509Certificate))
                 .Build();
 
+            
+
             ServiceProvider serviceProvider = new();
             serviceProvider.Add(_gotifyMessageStore);
             serviceProvider.Add(_gotifyUserAuthenticator);
@@ -80,6 +87,10 @@ namespace Mail2Gotify.Services
             _logger.Log(LogLevel.Information, $"Mail2Gotify server starting!");
 
             _smtpServer = new SmtpServer.SmtpServer(options, serviceProvider);
+
+            _cancellationToken = cancellationToken;
+            _smtpServer.SessionCreated += OnSessionCreated;
+
             await _smtpServer.StartAsync(cancellationToken);
         }
 
@@ -101,6 +112,59 @@ namespace Mail2Gotify.Services
             X509Certificate certificate = certificateRequest.CreateSelfSigned(DateTimeOffset.Now, DateTimeOffset.Now.AddYears(1));
 
             return new X509Certificate2(certificate.Export(X509ContentType.Pfx, _configuration["SelfSignedCertificate:Password"]), _configuration["SelfSignedCertificate:Password"]);
+        }
+
+                static void OnSessionFaulted(object sender, SessionFaultedEventArgs e)
+        {
+            Console.WriteLine("SessionFaulted: {0}", e.Exception);
+        }
+
+        static void OnSessionCancelled(object sender, SessionEventArgs e)
+        {
+            Console.WriteLine("SessionCancelled");
+        }
+
+        static void OnSessionCreated(object sender, SessionEventArgs e)
+        {
+            e.Context.Properties.Add("SessionID", Guid.NewGuid());
+
+            e.Context.CommandExecuting += OnCommandExecuting;
+            e.Context.CommandExecuted += OnCommandExecuted;
+            e.Context.ResponseException += OnResponseException;
+        }
+
+        private static void OnResponseException(object sender, SmtpResponseExceptionEventArgs e)
+        {
+            Console.WriteLine("Response Exception");
+            if (e.Exception.Properties.ContainsKey("SmtpSession:Buffer"))
+            {
+                var buffer = e.Exception.Properties["SmtpSession:Buffer"] as byte[];
+                Console.WriteLine("Unrecognized Command: {0}", Encoding.UTF8.GetString(buffer));
+            }
+        }
+
+        static void OnCommandExecuting(object sender, SmtpCommandEventArgs e)
+        {
+            Console.WriteLine("Command Executing (SessionID={0})", e.Context.Properties["SessionID"]);
+            new TracingSmtpCommandVisitor(Console.Out).Visit(e.Command);
+        }
+
+        static void OnCommandExecuted(object sender, SmtpCommandEventArgs e)
+        {
+            Console.WriteLine("Command Executed (SessionID={0})", e.Context.Properties["SessionID"]);
+            new TracingSmtpCommandVisitor(Console.Out).Visit(e.Command);
+        }
+
+        static void OnSessionCompleted(object sender, SessionEventArgs e)
+        {
+            Console.WriteLine("SessionCompleted: {0}", e.Context.Properties[EndpointListener.RemoteEndPointKey]);
+
+            e.Context.CommandExecuting -= OnCommandExecuting;
+            e.Context.CommandExecuted -= OnCommandExecuted;
+            e.Context.ResponseException -= OnResponseException;
+
+            CancellationTokenSource _cancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(_cancellationToken);
+            _cancellationTokenSource.Cancel();
         }
     }
 }
